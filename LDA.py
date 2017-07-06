@@ -1,8 +1,7 @@
-
 import numpy as np
 import scipy.sparse as sp
 
-from sklearn.utils import check_random_state,check_array,_get_n_jobs
+from sklearn.utils import check_random_state, check_array, _get_n_jobs
 
 from sklearn.utils.validation import check_non_negative
 import warnings
@@ -105,7 +104,6 @@ class LDA:
         self.verbose = verbose
         self.random_state = random_state
 
-
     def _check_params(self):
         """Check model parameters."""
         self._n_components = self.n_components
@@ -114,7 +112,15 @@ class LDA:
             raise ValueError("Invalid 'n_components' parameter: %r"
                              % self._n_components)
 
-    def _init_latent_vars(self,n_features):
+    def _get_prior(self, prior, t):
+        if isinstance(prior, float):
+            return prior
+        elif isinstance(prior, list):
+            return prior[t]
+        elif callable(prior):
+            return prior(t)
+
+    def _init_latent_vars(self, X):
         """Initialize latent variables."""
 
         self.random_state_ = check_random_state(self.random_state)
@@ -130,13 +136,22 @@ class LDA:
         else:
             self.topic_word_prior_ = self.topic_word_prior
 
-        init_gamma = 100.
-        init_var = 1. / init_gamma
-        # In the literature, this is called `lambda`
-        self.components_ = self.random_state_.gamma(
-            init_gamma, init_var, (self._n_components, n_features))
+        self.word_topic_ = {}
+        self.doc_topic_count_ = np.zeros([X.shape[0], self.n_components])
+        self.topic_word_count_ = {}
+        self.topic_count_ = np.zeros([self.n_components])
 
+        topic_distrib = self.random_state_.dirichlet(np.ones(self.n_components) *
+                                                     self._get_prior(self.doc_topic_prior_, self.n_iter_), X.shape[0])
 
+        for i in xrange(X.shape[0]):
+            for j in xrange(X.shape[1]):
+                if X[i][j] != 0:
+                    topic = np.random.choice(self.n_components, 1, p=topic_distrib[i])[0]
+                    self.word_topic_[(i, j)] = topic
+                    self.doc_topic_count_[i][topic] += 1
+                    self.topic_word_count_[(topic, j)] = self.topic_word_count_.get((topic, j), 0) + 1
+                    self.topic_count_[topic] += 1
 
     def _check_non_neg_array(self, X, whom):
         """check X format
@@ -151,7 +166,6 @@ class LDA:
         X = check_array(X, accept_sparse='csr')
         check_non_negative(X, whom)
         return X
-
 
     def fit(self, X, y=None):
         """Learn model for the data X with variational Bayes method.
@@ -170,54 +184,42 @@ class LDA:
         """
         self._check_params()
         X = self._check_non_neg_array(X, "LDA.fit")
-        n_samples, n_features = X.shape
         max_iter = self.max_iter
         evaluate_every = self.evaluate_every
-        learning_method = self.learning_method
-        if learning_method is None:
-            warnings.warn("The default value for 'learning_method' will be "
-                          "changed from 'online' to 'batch' in the release "
-                          "0.20. This warning was introduced in 0.18.",
-                          DeprecationWarning)
-            learning_method = 'online'
-
-        batch_size = self.batch_size
 
         # initialize parameters
-        self._init_latent_vars(n_features)
+        self._init_latent_vars(X)
         # change to perplexity later
         last_bound = None
-        n_jobs = _get_n_jobs(self.n_jobs)
-        with Parallel(n_jobs=n_jobs, verbose=max(0,
-                      self.verbose - 1)) as parallel:
-            for i in xrange(max_iter):
-                if learning_method == 'online':
-                    for idx_slice in gen_batches(n_samples, batch_size):
-                        self._em_step(X[idx_slice, :], total_samples=n_samples,
-                                      batch_update=False, parallel=parallel)
-                else:
-                    # batch update
-                    self._em_step(X, total_samples=n_samples,
-                                  batch_update=True, parallel=parallel)
+        for i in range(max_iter):
+            for (doc, word) in self.word_topic_:
+                old_topic = self.word_topic_[(doc, word)]
+                self.doc_topic_count_[doc][old_topic] -= 1
+                self.topic_word_count_[(old_topic, word)] -= 1
+                self.topic_count_[old_topic] -= 1
+                new_topic = self.gibbs_sample()
+                self.doc_topic_count_[doc][new_topic] += 1
+                self.topic_word_count_[(new_topic, word)] += 1
+                self.topic_count_[new_topic] += 1
 
-                # check perplexity
-                if evaluate_every > 0 and (i + 1) % evaluate_every == 0:
-                    doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
-                                                       random_init=False,
-                                                       parallel=parallel)
-                    bound = self._perplexity_precomp_distr(X, doc_topics_distr,
-                                                           sub_sampling=False)
-                    if self.verbose:
-                        print('iteration: %d of max_iter: %d, perplexity: %.4f'
-                              % (i + 1, max_iter, bound))
+            # check perplexity
+            if evaluate_every > 0 and (i + 1) % evaluate_every == 0:
+                doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
+                                                   random_init=False,
+                                                   parallel=parallel)
+                bound = self._perplexity_precomp_distr(X, doc_topics_distr,
+                                                       sub_sampling=False)
+                if self.verbose:
+                    print('iteration: %d of max_iter: %d, perplexity: %.4f'
+                          % (i + 1, max_iter, bound))
 
-                    if last_bound and abs(last_bound - bound) < self.perp_tol:
-                        break
-                    last_bound = bound
+                if last_bound and abs(last_bound - bound) < self.perp_tol:
+                    break
+                last_bound = bound
 
-                elif self.verbose:
-                    print('iteration: %d of max_iter: %d' % (i + 1, max_iter))
-                self.n_iter_ += 1
+            elif self.verbose:
+                print('iteration: %d of max_iter: %d' % (i + 1, max_iter))
+            self.n_iter_ += 1
 
         # calculate final perplexity value on train set
         doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
@@ -227,3 +229,152 @@ class LDA:
                                                      sub_sampling=False)
 
         return self
+
+    def score(self, X, y=None):
+        """Calculate approximate log-likelihood as score.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix, shape=(n_samples, n_features)
+            Document word matrix.
+
+        Returns
+        -------
+        score : float
+            Use approximate bound as score.
+        """
+        X = self._check_non_neg_array(X, "LatentDirichletAllocation.score")
+
+        doc_topic_distr = self._unnormalized_transform(X)
+        score = self._approx_bound(X, doc_topic_distr, sub_sampling=False)
+        return score
+
+    def _perplexity_precomp_distr(self, X, doc_topic_distr=None,
+                                  sub_sampling=False):
+        """Calculate approximate perplexity for data X with ability to accept
+        precomputed doc_topic_distr
+
+        Perplexity is defined as exp(-1. * log-likelihood per word)
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix, [n_samples, n_features]
+            Document word matrix.
+
+        doc_topic_distr : None or array, shape=(n_samples, n_components)
+            Document topic distribution.
+            If it is None, it will be generated by applying transform on X.
+
+        Returns
+        -------
+        score : float
+            Perplexity score.
+        """
+        if not hasattr(self, 'components_'):
+            from sklearn.exceptions import NotFittedError
+            raise NotFittedError("no 'components_' attribute in model."
+                                 " Please fit model first.")
+
+        X = self._check_non_neg_array(X,
+                                      "LatentDirichletAllocation.perplexity")
+
+        if doc_topic_distr is None:
+            doc_topic_distr = self._unnormalized_transform(X)
+        else:
+            n_samples, n_components = doc_topic_distr.shape
+            if n_samples != X.shape[0]:
+                raise ValueError("Number of samples in X and doc_topic_distr"
+                                 " do not match.")
+
+            if n_components != self._n_components:
+                raise ValueError("Number of topics does not match.")
+
+        current_samples = X.shape[0]
+        bound = self._approx_bound(X, doc_topic_distr, sub_sampling)
+
+        if sub_sampling:
+            word_cnt = X.sum() * (float(self.total_samples) / current_samples)
+        else:
+            word_cnt = X.sum()
+        perword_bound = bound / word_cnt
+
+        return np.exp(-1.0 * perword_bound)
+
+    def perplexity(self, X, doc_topic_distr='deprecated', sub_sampling=False):
+        """Calculate approximate perplexity for data X.
+
+        Perplexity is defined as exp(-1. * log-likelihood per word)
+
+        .. versionchanged:: 0.19
+           *doc_topic_distr* argument has been deprecated and is ignored
+           because user no longer has access to unnormalized distribution
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix, [n_samples, n_features]
+            Document word matrix.
+
+        doc_topic_distr : None or array, shape=(n_samples, n_components)
+            Document topic distribution.
+            This argument is deprecated and is currently being ignored.
+
+            .. deprecated:: 0.19
+
+        Returns
+        -------
+        score : float
+            Perplexity score.
+        """
+        if doc_topic_distr != 'deprecated':
+            warnings.warn("Argument 'doc_topic_distr' is deprecated and is "
+                          "being ignored as of 0.19. Support for this "
+                          "argument will be removed in 0.21.",
+                          DeprecationWarning)
+
+        return self._perplexity_precomp_distr(X, sub_sampling=sub_sampling)
+
+    def _unnormalized_transform(self, X):
+        """Transform data X according to fitted model.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix, shape=(n_samples, n_features)
+            Document word matrix.
+
+        Returns
+        -------
+        doc_topic_distr : shape=(n_samples, n_components)
+            Document topic distribution for X.
+        """
+        if not hasattr(self, 'components_'):
+            from sklearn.exceptions import NotFittedError
+            raise NotFittedError("no 'components_' attribute in model."
+                                 " Please fit model first.")
+
+        # make sure feature size is the same in fitted model and in X
+        X = self._check_non_neg_array(X, "LatentDirichletAllocation.transform")
+
+        doc_topic_distr, _ = self._e_step(X, cal_sstats=False,
+                                          random_init=False)
+
+        return doc_topic_distr
+
+    def transform(self, X):
+        """Transform data X according to the fitted model.
+
+           .. versionchanged:: 0.18
+              *doc_topic_distr* is now normalized
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix, shape=(n_samples, n_features)
+            Document word matrix.
+
+        Returns
+        -------
+        doc_topic_distr : shape=(n_samples, n_components)
+            Document topic distribution for X.
+        """
+        doc_topic_distr = self._unnormalized_transform(X)
+        doc_topic_distr /= doc_topic_distr.sum(axis=1)[:, np.newaxis]
+        return doc_topic_distr
