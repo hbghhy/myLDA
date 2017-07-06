@@ -112,13 +112,13 @@ class LDA:
             raise ValueError("Invalid 'n_components' parameter: %r"
                              % self._n_components)
 
-    def _get_prior(self, prior, t):
+    def _get_prior(self, prior):
         if isinstance(prior, float):
             return prior
         elif isinstance(prior, list):
-            return prior[t]
+            return prior[self.n_iter_]
         elif callable(prior):
-            return prior(t)
+            return prior(self.n_iter_)
 
     def _init_latent_vars(self, X):
         """Initialize latent variables."""
@@ -135,17 +135,19 @@ class LDA:
             self.topic_word_prior_ = 1. / self._n_components
         else:
             self.topic_word_prior_ = self.topic_word_prior
+        self.n_samples_, self.n_features_ = X.shape
 
         self.word_topic_ = {}
-        self.doc_topic_count_ = np.zeros([X.shape[0], self.n_components])
+        self.doc_topic_count_ = np.zeros([self.n_samples_, self.n_components])
         self.topic_word_count_ = {}
         self.topic_count_ = np.zeros([self.n_components])
 
         topic_distrib = self.random_state_.dirichlet(np.ones(self.n_components) *
-                                                     self._get_prior(self.doc_topic_prior_, self.n_iter_), X.shape[0])
+                                                     self._get_prior(self.doc_topic_prior_),
+                                                     self.n_samples_)
 
-        for i in xrange(X.shape[0]):
-            for j in xrange(X.shape[1]):
+        for i in xrange(self.n_samples_):
+            for j in xrange(self.n_features_):
                 if X[i][j] != 0:
                     topic = np.random.choice(self.n_components, 1, p=topic_distrib[i])[0]
                     self.word_topic_[(i, j)] = topic
@@ -166,6 +168,30 @@ class LDA:
         X = check_array(X, accept_sparse='csr')
         check_non_negative(X, whom)
         return X
+
+    def _gibbs_sample(self, doc, word):
+        old_topic = self.word_topic_[(doc, word)]
+        self.doc_topic_count_[doc][old_topic] -= 1
+        self.topic_word_count_[(old_topic, word)] -= 1
+        self.topic_count_[old_topic] -= 1
+        p_topic = np.zeros(self.n_components)
+        whole = 0.
+        for i in range(self.n_components):
+            temp = (self.topic_word_count_[(i,word)]+self._get_prior(self.topic_word_prior_))
+            temp*=(self.doc_topic_count_[doc][i]+self._get_prior(self.doc_topic_prior_))
+            temp/=(self.topic_count_[i]+self.n_features_*self._get_prior(self.topic_word_prior))
+            whole+=temp
+            p_topic[i]=temp
+        r=np.random.random(whole)
+        for i in range(self.n_components):
+            r-=p_topic[i]
+            if r<=0:
+                new_topic=i
+                break
+        self.doc_topic_count_[doc][new_topic] += 1
+        self.topic_word_count_[(new_topic, word)] += 1
+        self.topic_count_[new_topic] += 1
+        self.word_topic_[(doc,word)]=new_topic
 
     def fit(self, X, y=None):
         """Learn model for the data X with variational Bayes method.
@@ -193,15 +219,7 @@ class LDA:
         last_bound = None
         for i in range(max_iter):
             for (doc, word) in self.word_topic_:
-                old_topic = self.word_topic_[(doc, word)]
-                self.doc_topic_count_[doc][old_topic] -= 1
-                self.topic_word_count_[(old_topic, word)] -= 1
-                self.topic_count_[old_topic] -= 1
-                new_topic = self.gibbs_sample()
-                self.doc_topic_count_[doc][new_topic] += 1
-                self.topic_word_count_[(new_topic, word)] += 1
-                self.topic_count_[new_topic] += 1
-
+                self._gibbs_sample(doc, word)
             # check perplexity
             if evaluate_every > 0 and (i + 1) % evaluate_every == 0:
                 doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
@@ -229,25 +247,6 @@ class LDA:
                                                      sub_sampling=False)
 
         return self
-
-    def score(self, X, y=None):
-        """Calculate approximate log-likelihood as score.
-
-        Parameters
-        ----------
-        X : array-like or sparse matrix, shape=(n_samples, n_features)
-            Document word matrix.
-
-        Returns
-        -------
-        score : float
-            Use approximate bound as score.
-        """
-        X = self._check_non_neg_array(X, "LatentDirichletAllocation.score")
-
-        doc_topic_distr = self._unnormalized_transform(X)
-        score = self._approx_bound(X, doc_topic_distr, sub_sampling=False)
-        return score
 
     def _perplexity_precomp_distr(self, X, doc_topic_distr=None,
                                   sub_sampling=False):
