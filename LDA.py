@@ -145,6 +145,8 @@ class LDA:
         topic_distrib = self.random_state_.dirichlet(np.ones(self.n_components) *
                                                      self._get_prior(self.doc_topic_prior_),
                                                      self.n_samples_)
+        self.theta = np.zeros([self.n_samples_, self.n_components])
+        self.phi = {}
 
         for i in xrange(self.n_samples_):
             for j in xrange(self.n_features_):
@@ -154,6 +156,7 @@ class LDA:
                     self.doc_topic_count_[i][topic] += 1
                     self.topic_word_count_[(topic, j)] = self.topic_word_count_.get((topic, j), 0) + 1
                     self.topic_count_[topic] += 1
+        self._estimate_parameter()
 
     def _check_non_neg_array(self, X, whom):
         """check X format
@@ -169,6 +172,19 @@ class LDA:
         check_non_negative(X, whom)
         return X
 
+    def _estimate_parameter(self):
+        self.theta = (self.doc_topic_count_ + self._get_prior(self.doc_topic_prior_)) / \
+                     (self.doc_topic_count_.sum() + self._get_prior(self.doc_topic_prior_) * self.n_components)
+        for (topic, word) in self.topic_word_count_:
+            self.phi[(topic, word)] = (self.topic_word_count_[(topic, word)]
+                                       + self._get_prior(self.topic_word_prior_)) / \
+                                      (self.topic_count_[topic]
+                                       + self._get_prior(self.topic_word_prior_) * self.n_features_)
+        for topic in range(self.n_components):
+            self.phi[topic] = self._get_prior(self.topic_word_prior_) / \
+                              (self.topic_count_[topic]
+                               + self._get_prior(self.topic_word_prior_) * self.n_features_)
+
     def _gibbs_sample(self, doc, word):
         old_topic = self.word_topic_[(doc, word)]
         self.doc_topic_count_[doc][old_topic] -= 1
@@ -177,27 +193,24 @@ class LDA:
         p_topic = np.zeros(self.n_components)
         whole = 0.
         for i in range(self.n_components):
-            temp = (self.topic_word_count_[(i,word)]+self._get_prior(self.topic_word_prior_))
-            temp*=(self.doc_topic_count_[doc][i]+self._get_prior(self.doc_topic_prior_))
-            temp/=(self.topic_count_[i]+self.n_features_*self._get_prior(self.topic_word_prior))
-            whole+=temp
-            p_topic[i]=temp
-        r=np.random.random(whole)
+            temp = (self.topic_word_count_[(i, word)] + self._get_prior(self.topic_word_prior_))
+            temp *= (self.doc_topic_count_[doc][i] + self._get_prior(self.doc_topic_prior_))
+            temp /= (self.topic_count_[i] + self.n_features_ * self._get_prior(self.topic_word_prior))
+            whole += temp
+            p_topic[i] = temp
+        r = np.random.random(whole)
         for i in range(self.n_components):
-            r-=p_topic[i]
-            if r<=0:
-                new_topic=i
+            r -= p_topic[i]
+            if r <= 0:
+                new_topic = i
                 break
         self.doc_topic_count_[doc][new_topic] += 1
         self.topic_word_count_[(new_topic, word)] += 1
         self.topic_count_[new_topic] += 1
-        self.word_topic_[(doc,word)]=new_topic
+        self.word_topic_[(doc, word)] = new_topic
 
     def fit(self, X, y=None):
-        """Learn model for the data X with variational Bayes method.
-
-        When `learning_method` is 'online', use mini-batch update.
-        Otherwise, use batch update.
+        """Learn model for the data X with gibbs sampling method.
 
         Parameters
         ----------
@@ -216,35 +229,27 @@ class LDA:
         # initialize parameters
         self._init_latent_vars(X)
         # change to perplexity later
-        last_bound = None
+        last_perplexity = None
         for i in range(max_iter):
             for (doc, word) in self.word_topic_:
                 self._gibbs_sample(doc, word)
             # check perplexity
             if evaluate_every > 0 and (i + 1) % evaluate_every == 0:
-                doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
-                                                   random_init=False,
-                                                   parallel=parallel)
-                bound = self._perplexity_precomp_distr(X, doc_topics_distr,
-                                                       sub_sampling=False)
+                self._estimate_parameter()
+                perplexity = self._perplexity()
                 if self.verbose:
                     print('iteration: %d of max_iter: %d, perplexity: %.4f'
-                          % (i + 1, max_iter, bound))
+                          % (i + 1, max_iter, perplexity))
 
-                if last_bound and abs(last_bound - bound) < self.perp_tol:
+                if last_perplexity and abs(last_perplexity - perplexity) < self.perp_tol:
                     break
-                last_bound = bound
+                last_perplexity = perplexity
 
             elif self.verbose:
                 print('iteration: %d of max_iter: %d' % (i + 1, max_iter))
             self.n_iter_ += 1
 
-        # calculate final perplexity value on train set
-        doc_topics_distr, _ = self._e_step(X, cal_sstats=False,
-                                           random_init=False,
-                                           parallel=parallel)
-        self.bound_ = self._perplexity_precomp_distr(X, doc_topics_distr,
-                                                     sub_sampling=False)
+        self.perplexity = self._perplexity()
 
         return self
 
